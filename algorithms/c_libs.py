@@ -33,7 +33,7 @@ def _ensure_built(so_path: Path) -> None:
     """
     if so_path.exists():
         return
-    if os.environ.get('REP_EATER_IN_CONTAINER'):
+    if os.environ.get('HIREPEAT_IN_CONTAINER'):
         raise RuntimeError(
             f"{so_path} is missing from the container image, which should be "
             "impossible — `make` runs at image build time."

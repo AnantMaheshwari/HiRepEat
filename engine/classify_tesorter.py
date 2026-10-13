@@ -1,7 +1,7 @@
 """
 Classify LTR consensus sequences using TEsorter (rexdb HMM database).
 
-Runs TEsorter — from PATH, or out of the RepEater container image — and parses
+Runs TEsorter — from PATH, or out of the HiRepEat container image — and parses
 the .cls.tsv output to produce a classified FASTA with class/domain tags
 appended to each header.
 """

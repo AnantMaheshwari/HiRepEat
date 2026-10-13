@@ -1,4 +1,4 @@
-# External repositories adapted for RepEater framework
+# External repositories adapted for HiRepEat framework
 
 We build functionality on top of the following repositories from Gene Myers and Richard Durbin for LTR-RT detection framework, as described below. 
 

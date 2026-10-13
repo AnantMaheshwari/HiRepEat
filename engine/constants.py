@@ -1,4 +1,4 @@
-"""Tuning constants for the RepEater pipeline.
+"""Tuning constants for the HiRepEat pipeline.
 """
 
 # ---------------------------------------------------------------------------

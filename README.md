@@ -1,8 +1,19 @@
 <table>
 <tr>
+<td width="120">
+<img src="images/mosquito_eating_repeats.png" width="120" alt="HiRepEat logo">
+</td>
 <td>
 
-# RepEater framework
+# <strong>Hi</strong>erarchical<strong>Rep</strong>eat<strong>Eat</strong>er
+
+</td>
+</tr>
+</table>
+
+<table>
+<tr>
+<td>
 
 A framework for **de novo discovery, clustering, and classification of LTR retrotransposons**, building on Myers' FasTAN and FastLTR (https://github.com/thegenemyers/FASTAN)
 
@@ -11,7 +22,7 @@ a TE consensus library suitable for annotation, alongside intermediate outputs i
 
 </td>
 <td width="220">
-<img src="images/cross_genome_high_res.png" width="220" alt="RepEater framework overview">
+<img src="images/cross_genome_high_res.png" width="220" alt="HiRepEat framework overview">
 </td>
 </tr>
 </table>
@@ -19,7 +30,7 @@ a TE consensus library suitable for annotation, alongside intermediate outputs i
 ---
 
 <p align="center">
-<img src="images/methods.png" alt="RepEater method overview">
+<img src="images/methods.png" alt="HiRepEat method overview">
 </p>
 
 ---
@@ -58,7 +69,9 @@ Iterates:
   writes a reversible coordinate map (`.1taco`) so any coordinate can be lifted back
   to the original genome.
 
-`--tandem-rounds N` repeats (FasTAN → taco/salsa) iteratively, in order to delete nested tandem structures. 
+`--tandem-rounds N` repeats (FasTAN → taco/salsa) iteratively, in order to delete nested tandem structures.
+
+`--rounds 0` tandem compression only, no LTR detection, clustering, classification, collapse etc.
 
 ### 2. LTR detection
 
@@ -85,11 +98,11 @@ Similarity graph is built with LTR-RT instances as nodes, edges constructed if L
 **Installation:**
 
 ```bash
-singularity pull RepEater.sif docker://ghcr.io/anantmaheshwari/rep_eater:latest
+singularity pull HiRepEat.sif docker://ghcr.io/anantmaheshwari/hirepeat:latest
 ```
 
 **Execution:**
-`singularity exec RepEater.sif RepEater --genome genome.fa --rounds 10`
+`singularity exec HiRepEat.sif HiRepEat --genome genome.fa --rounds 10`
 
 The image carries TEsorter, hmmer and BLAST.
 
@@ -104,8 +117,8 @@ make
 ```
 
 `make` builds everything except TEsorter. Supply that with either the image
-above (`export REP_EATER_IMAGE=/path/to/RepEater.sif`), a TEsorter on `PATH`, or
-`export REP_EATER_TOOL_PATH=<tesorter bin>:<blast bin>:<hmmer bin>` for an
+above (`export HIREPEAT_IMAGE=/path/to/HiRepEat.sif`), a TEsorter on `PATH`, or
+`export HIREPEAT_TOOL_PATH=<tesorter bin>:<blast bin>:<hmmer bin>` for an
 existing install.
 
 ---
@@ -115,7 +128,7 @@ existing install.
 ### From a container image
 
 ```bash
-singularity exec RepEater.sif RepEater --genome genome.fa --threads 8 --rounds 10
+singularity exec HiRepEat.sif HiRepEat --genome genome.fa --threads 8 --rounds 10
 ```
 
 ### From source 
@@ -123,7 +136,7 @@ singularity exec RepEater.sif RepEater --genome genome.fa --threads 8 --rounds 1
 ```bash
 source env/bin/activate
 export PYTHONPATH=$(pwd)
-export REP_EATER_IMAGE=/path/to/RepEater.sif    # only if TEsorter is not on PATH
+export HIREPEAT_IMAGE=/path/to/HiRepEat.sif    # only if TEsorter is not on PATH
 
 # Simplest run
 python engine/detect.py --genome genome.fa --threads 8
@@ -137,6 +150,8 @@ MIT, see [LICENSE](LICENSE).
 
 ## Citation
 
-If you use RepEater in your research, please cite:
+Mosquito artwork thanks to Petra Korlevic.
 
-> Maheshwari A, Sierra P, Myers EW, Lawniczak MKN, Durbin R. Efficient and precise discovery of LTR-retrotransposon families using RepEater. *bioRxiv* (2026). 
+If you use HiRepEat in your research, please cite:
+
+> Maheshwari A, Myers EW, Sierra P, Lawniczak MKN, Durbin R. Efficient and precise discovery of LTR-retrotransposon families using HiRepEat. *bioRxiv* (2026). 

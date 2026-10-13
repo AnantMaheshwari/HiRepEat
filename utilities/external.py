@@ -42,12 +42,12 @@ def set_image(path) -> None:
 def image_path() -> Path | None:
     if _IMAGE_OVERRIDE is not None:
         return _IMAGE_OVERRIDE
-    env = os.environ.get('REP_EATER_IMAGE')
+    env = os.environ.get('HIREPEAT_IMAGE')
     return Path(env).resolve() if env else None
 
 
 def in_container() -> bool:
-    return bool(os.environ.get('REP_EATER_IN_CONTAINER'))
+    return bool(os.environ.get('HIREPEAT_IN_CONTAINER'))
 
 
 def _container_runtime() -> str | None:
@@ -55,14 +55,14 @@ def _container_runtime() -> str | None:
 
 
 def _search_path() -> str:
-    """PATH to search for TEsorter, with $REP_EATER_TOOL_PATH prepended."""
+    """PATH to search for TEsorter, with $HIREPEAT_TOOL_PATH prepended."""
     base = os.environ.get('PATH', os.defpath)
-    extra = os.environ.get('REP_EATER_TOOL_PATH')
+    extra = os.environ.get('HIREPEAT_TOOL_PATH')
     return f"{extra}:{base}" if extra else base
 
 
 def tool_env() -> dict | None:
-    extra = os.environ.get('REP_EATER_TOOL_PATH')
+    extra = os.environ.get('HIREPEAT_TOOL_PATH')
     if not extra:
         return None
     env = os.environ.copy()
@@ -174,12 +174,12 @@ def probe_versions() -> dict:
         prefix = [runtime, 'exec', '--cleanenv', str(sif)]
         labels = _sif_labels(sif)
         if labels:
-            info['tesorter'] = labels.get('io.rep_eater.tesorter')
-            info['hmmer'] = labels.get('io.rep_eater.hmmer')
-            info['blast'] = labels.get('io.rep_eater.rmblast')
-            info['repeater_image_version'] = labels.get(
+            info['tesorter'] = labels.get('io.hirepeat.tesorter')
+            info['hmmer'] = labels.get('io.hirepeat.hmmer')
+            info['blast'] = labels.get('io.hirepeat.rmblast')
+            info['hirepeat_image_version'] = labels.get(
                 'org.opencontainers.image.version')
-            info['repeater_image_revision'] = labels.get(
+            info['hirepeat_image_revision'] = labels.get(
                 'org.opencontainers.image.revision')
             if all(info[k] for k in ('tesorter', 'hmmer', 'blast')):
                 return info

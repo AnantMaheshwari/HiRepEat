@@ -186,7 +186,7 @@ def setup_logging(log_path) -> Path:
     _log_fh = open(log_path, 'a', buffering=1)  
     _log_fh.write(
         f"\n# {'═' * 70}\n"
-        f"# RepEater run log\n"
+        f"# HiRepEat run log\n"
         f"# started : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
         f"# command : {shlex.join(sys.argv)}\n"
         f"# log     : {log_path}\n"

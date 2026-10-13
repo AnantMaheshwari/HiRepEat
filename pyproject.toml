@@ -3,7 +3,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "RepEater"
+name = "HiRepEat"
 version = "0.1.0"
 description = "De novo discovery, clustering and classification of LTR retrotransposons"
 readme = "README.md"
@@ -20,10 +20,10 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/AnantMaheshwari/RepEater"
+Homepage = "https://github.com/AnantMaheshwari/HiRepEat"
 
 [project.scripts]
-RepEater = "engine.detect:main"
+HiRepEat = "engine.detect:main"
 
 [tool.setuptools]
 packages = ["engine", "algorithms", "utilities", "seq"]

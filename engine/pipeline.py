@@ -1,4 +1,4 @@
-"""RepEater pipeline: tandem compression, LTR detection, clustering, consensus, iterative collapse.
+"""HiRepEat pipeline: tandem compression, LTR detection, clustering, consensus, iterative collapse.
 """
 
 import os
@@ -297,6 +297,43 @@ def detect_and_extract(genome, base, output_dir, tandem_rounds,
     log.info(f"  [timing] detect_and_extract total: "
              f"{time.perf_counter() - t_total:.2f}s")
     return extracted_fasta, genome_for_ltr, tandem_layers
+
+
+def guard_tandem_only_outputs(output_dir, genome, detect_marker):
+    stem = Path(genome).stem
+    if os.environ.get('HIREPEAT_FORCE_TANDEM'):
+        log.warn("HIREPEAT_FORCE_TANDEM set: overwriting existing tandem layers.")
+        return
+
+    detect_marker = Path(detect_marker)
+    if detect_marker.exists():
+        raise ResumeError(
+            f"{detect_marker} already exists"
+        )
+
+    existing = sorted(_tandem_dir(output_dir).glob(f"{stem}_taniter*.1taco"))
+    if existing:
+        raise ResumeError(
+            f"{_tandem_dir(output_dir)} already holds {len(existing)} tandem layers"
+        )
+
+
+def run_tandem_only(genome, output_dir, tandem_rounds,
+                    skip_converged_contigs=True, prune_genomes=False):
+    """Tandem compression only — no LTR-RT detection.  Used by `--rounds 0`.
+    """
+    log.stage(f"Tandem compression only ({tandem_rounds} max iteration(s))")
+    collapsed, layers = run_fastan(
+        genome, output_dir,
+        max_iterations=tandem_rounds,
+        skip_converged_contigs=skip_converged_contigs,
+        prune_genomes=prune_genomes,
+    )
+    if not layers:
+        log.warn("FasTAN found no tandem repeats.")
+    log.step(f"  Tandem-compressed genome: {collapsed}")
+    log.step(f"  {len(layers)} taco layer(s) under {_tandem_dir(output_dir)}")
+    return collapsed, layers
 
 
 def combine_genome_fastas(extracted_fastas, combined_fasta):
@@ -663,9 +700,9 @@ def run_rounds(genome_for_ltr, base, output_dir, round1_extracted,
     skip_converged   = True
     next_active_file = None
 
-    no_node_reuse = bool(os.environ.get('RF_NO_NODE_REUSE'))
+    no_node_reuse = bool(os.environ.get('HIREPEAT_NO_NODE_REUSE'))
     if no_node_reuse:
-        log.stage("  [RF_NO_NODE_REUSE] node + edge reuse DISABLED "
+        log.stage("  [HIREPEAT_NO_NODE_REUSE] node + edge reuse DISABLED "
                   "(full universe rebuild + from-scratch re-cluster each round)")
 
     final_classified_src = None

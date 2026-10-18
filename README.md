@@ -150,8 +150,10 @@ MIT, see [LICENSE](LICENSE).
 
 ## Citation
 
-Mosquito artwork thanks to Petra Korlevic.
-
 If you use HiRepEat in your research, please cite:
 
-> Maheshwari A, Myers EW, Sierra P, Lawniczak MKN, Durbin R. Efficient and precise discovery of LTR-retrotransposon families using HiRepEat. *bioRxiv* (2026). 
+[![bioRxiv](https://img.shields.io/badge/bioRxiv-10.64898%2F2026.10.14.759201-b31b1b.svg)](https://doi.org/10.64898/2026.10.14.759201)
+> Maheshwari A, Myers EW, Sierra P, Vertebrate
+Genomes Project Consortium Phase I, Lawniczak MKN, Durbin R. Efficient and precise discovery of LTR-retrotransposon families using HiRepEat. *bioRxiv* (2026).
+
+Mosquito artwork thanks to Petra Korlevic.

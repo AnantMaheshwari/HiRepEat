@@ -25,10 +25,10 @@ def gml_safe_label(label):
     return re.sub(r'[-_.]', '', label)
 
 
-def set_folder_structure(path, suffix="_ltr_output"):
-    """Create <stem><suffix>/ in CWD.  Returns (stem, Path)."""
+def set_folder_structure(path, suffix="_ltr_output", parent=None):
+    """Create <stem><suffix>/ in *parent* (default CWD).  Returns (stem, Path)."""
     name = strip_genome_name(path)
-    output_dir = Path(f"{name}{suffix}")
-    output_dir.mkdir(exist_ok=True)
+    output_dir = Path(parent or '.') / f"{name}{suffix}"
+    output_dir.mkdir(parents=True, exist_ok=True)
     log.stage(f"Output directory: {output_dir}")
     return name, output_dir

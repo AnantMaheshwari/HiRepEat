@@ -4,6 +4,7 @@
 import os
 import subprocess
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from engine.constants import FASTAN_SCAN_FLANK, PRUNE_GENOMES
@@ -299,17 +300,38 @@ def detect_and_extract(genome, base, output_dir, tandem_rounds,
     return extracted_fasta, genome_for_ltr, tandem_layers
 
 
-def guard_tandem_only_outputs(output_dir, genome, detect_marker):
+def check_genome_list_resume(prior_params, genome_paths, output_dir):
+    """Refuse to resume a cross-genome run onto a different set of genomes.
+    """
+    prior = ((prior_params or {}).get('input') or {}).get('genomes')
+    if not prior:
+        return
+    prior_set = {str(p) for p in (prior if isinstance(prior, list) else [prior])}
+    now_set   = {str(Path(p).resolve()) for p in genome_paths}
+    if prior_set == now_set:
+        return
+
+    added   = sorted(now_set - prior_set)
+    removed = sorted(prior_set - now_set)
+    raise ResumeError(
+        f"{output_dir} holds results for a different set of genomes:\n"
+        + ''.join(f"    added:   {p}\n" for p in added)
+        + ''.join(f"    removed: {p}\n" for p in removed)
+    )
+
+def guard_tandem_only_outputs(output_dir, genome, detect_markers):
     stem = Path(genome).stem
     if os.environ.get('HIREPEAT_FORCE_TANDEM'):
         log.warn("HIREPEAT_FORCE_TANDEM set: overwriting existing tandem layers.")
         return
 
-    detect_marker = Path(detect_marker)
-    if detect_marker.exists():
-        raise ResumeError(
-            f"{detect_marker} already exists"
-        )
+    if isinstance(detect_markers, (str, Path)):
+        detect_markers = [detect_markers]
+    for detect_marker in map(Path, detect_markers):
+        if detect_marker.exists():
+            raise ResumeError(
+                f"{detect_marker} already exists"
+            )
 
     existing = sorted(_tandem_dir(output_dir).glob(f"{stem}_taniter*.1taco"))
     if existing:
@@ -336,21 +358,6 @@ def run_tandem_only(genome, output_dir, tandem_rounds,
     return collapsed, layers
 
 
-def combine_genome_fastas(extracted_fastas, combined_fasta):
-    """Concatenate per-genome extracted FASTAs, tagging every record with its
-    source genome (``<id>_<label>`` plus a ``genome=`` header field)."""
-    with open(combined_fasta, 'w') as out:
-        for fa, label in extracted_fastas:
-            gml_label = gml_safe_label(label)
-            with open(fa) as inp:
-                for line in inp:
-                    if line.startswith('>'):
-                        seqid, _, rest = line[1:].partition(' ')
-                        new_rest = (f"genome={gml_label} {rest}".strip()
-                                    if rest.strip() else f"genome={gml_label}")
-                        out.write(f'>{seqid}_{label} {new_rest}\n')
-                    else:
-                        out.write(line)
 
 
 # ---------------------------------------------------------------------------
@@ -562,9 +569,12 @@ def _collapse_spec_from_coords(member_coords, genome_fasta, output_tsv):
     scaffold_to_idx = {name: i for i, name in enumerate(order)}
 
     events = []
+    n_dropped = 0
     for scaffold, start, end in member_coords:
         if scaffold in scaffold_to_idx:
             events.append((scaffold_to_idx[scaffold], start, end, 0))
+        else:
+            n_dropped += 1
 
     merged = _merge_events(events)
     with open(output_tsv, 'w') as f:
@@ -573,7 +583,7 @@ def _collapse_spec_from_coords(member_coords, genome_fasta, output_tsv):
             f.write(f"{seq_idx}\t{start}\t{end}\t{unit}\n")
 
     active = {order[ev[0]] for ev in merged if 0 <= ev[0] < len(order)}
-    return len(merged), active
+    return len(merged), active, n_dropped
 
 
 # ---------------------------------------------------------------------------
@@ -611,464 +621,497 @@ def classify(consensi_fasta, output_fasta, args, label='classify',
     return output_fasta
 
 
-def cluster_and_classify(input_fasta, output_dir, args):
-    """Cluster one FASTA into families and classify the consensi.
+# ---------------------------------------------------------------------------
+# Per-genome state for the iterative collapse loop
+# ---------------------------------------------------------------------------
+
+@dataclass
+class GenomeState:
+    """Collapse loop state across rounds.
+    One instance in single-genome mode; one per genome under ``--genome-list``.
     """
-    os.environ['OMP_NUM_THREADS'] = str(max(1, args.threads))
+    source_path:  str
+    base:         str           
+    original_size: int
+    current_genome: str
+    round1_extracted: str
 
-    from engine.feature_cluster import (
-        _load_records, cluster_records_incremental, _ALGO_DIR, _write_gml,
-        write_classified_gml,
-    )
-    from algorithms.c_libs import KmerLib, WFALib
+    tandem_layers:     list = field(default_factory=list)
+    taco_stack:        list = field(default_factory=list)
+    node_seq:          dict = field(default_factory=dict)
+    contig_nodes:      dict = field(default_factory=dict)
+    collapsed_nodes:   set  = field(default_factory=set)
+    node_orig_coords:  dict = field(default_factory=dict)
+    last_removed_orig: dict = field(default_factory=dict)
+    coords_current:    dict = field(default_factory=dict)
+    scaffold_count:    int  = None
+    next_active_file:  str  = None
+    lifted_beds:       list = field(default_factory=list)
+    converged:         bool = False
 
-    out = Path(output_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    fcfg = build_feature_config(args)
+    # per-round scratch, consumed by the stats row
+    n_new:            int   = 0
+    round_active_pct: float = 100.0
+    round_skipped_bp: int   = 0
 
-    with timed("load FASTA + parse structural coordinates"):
-        records = _load_records(input_fasta)
-    if not records:
-        empty = str(out / 'consensi.fasta')
-        open(empty, 'w').close()
-        return empty, empty
+    def round_dir(self, output_dir, round_num, cross_genome):
+        d = Path(output_dir) / f"round{round_num}"
+        return d / self.base if cross_genome else d
 
-    kmer_lib = KmerLib(_ALGO_DIR / 'kmer_seed.so')
-    wfa_lib  = WFALib(_ALGO_DIR / 'wfa_align.so')
+    def tool_tag(self, cross_genome):
+        return f"_{self.base}" if cross_genome else ''
 
-    with timed("cluster"):
+    def node_name(self, orig_name, round_num, cross_genome):
+        """Graph-node name for a detection.
+        """
+        return (f"r{round_num}_{orig_name}_{self.base}" if cross_genome
+                else f"r{round_num}_{orig_name}")
+
+    def node_header(self, header, orig_name, pname, cross_genome):
+        """Rewrite a detection's FASTA header to carry its node name.
+        """
+        out = header.replace(f">{orig_name}", f">{pname}", 1)
+        if not cross_genome:
+            return out
+        seqid, _, rest = out[1:].partition(' ')
+        tag = f"genome={gml_safe_label(self.base)}"
+        return (f">{seqid} {tag} {rest.strip()}" if rest.strip()
+                else f">{seqid} {tag}")
+
+
+# ---------------------------------------------------------------------------
+# One round, one genome: detect, lift, reconcile nodes
+# ---------------------------------------------------------------------------
+
+def _round0_tandem(st, tandem_layers, round_stats, cross_genome):
+    """Seed a genome's taco stack with its tandem-compression layers."""
+    if not tandem_layers:
+        return
+    for taco_file, _ in tandem_layers:
+        st.taco_stack.append(taco_file)
+    compressed_size = seq_size(st.current_genome)
+    compress_pct = 100.0 * (1 - compressed_size / st.original_size)
+    tag = f" [{st.base}]" if cross_genome else ''
+    log.info(f"\n  Round 0 (tandem compression, {len(tandem_layers)} layer(s)):{tag}")
+    try:
+        log.block(log.INFO, run_info(tandem_layers[-1][0]))
+    except Exception:
+        pass
+    log.info(f"  Genome size: {st.original_size:,} → {compressed_size:,} bp "
+             f"({compress_pct:.1f}% removed)")
+    row = {
+        'round': '0(tan)', 'detections': '-', 'families': '-',
+        'non_ltr': '-', 'new_ltr_members': '-', 'collapse_events': '-',
+        'genome_size_bp': compressed_size, 'compression_pct': compress_pct,
+        'time_s': 0.0,
+    }
+    if cross_genome:
+        row['genome'] = st.base
+    round_stats.append(row)
+
+
+def _detect_round(st, round_num, max_rounds, round_dir, args,
+                  skip_converged, cross_genome):
+    st.round_active_pct = 100.0
+    st.round_skipped_bp = 0
+
+    stack_note = f", {len(st.taco_stack)} taco layer(s)" if st.taco_stack else ''
+    log.stage(f"\n── Round {round_num}/{max_rounds} ── "
+              f"{Path(st.current_genome).name}{stack_note}")
+    log.info(f"  Genome: {st.current_genome}")
+
+    if round_num == 1:
+        extracted_fa = str(st.round1_extracted)
+    else:
+        round_dir.mkdir(parents=True, exist_ok=True)
+        tag = st.tool_tag(cross_genome)
+        ltr_file = str(round_dir / f"{st.base}_round{round_num}_LTR.1aln")
+        if Path(ltr_file).exists():
+            try:
+                n_prev = aln_info(ltr_file)['alignments']
+            except Exception:
+                n_prev = None
+            log.stage(f"  [resume] Reusing existing {Path(ltr_file).name}"
+                      + (f" ({n_prev:,} alignments)" if n_prev is not None
+                         else " (unreadable — delete it if this run fails)"))
+            if n_prev == 0:
+                log.warn(f"{ltr_file} contains no alignments; delete it to "
+                         f"re-run FastLTR for this round.")
+        else:
+            cmd = [FASTLTR_BIN, '-v']
+            if skip_converged and st.next_active_file is not None \
+                    and Path(st.next_active_file).exists():
+                cmd.append(f'-r{st.next_active_file}')
+                try:
+                    with open(st.next_active_file) as af:
+                        active_names = {l.strip() for l in af if l.strip()}
+                    all_scafs = scaffold_order(st.current_genome)
+                    if all_scafs:
+                        st.round_active_pct = 100.0 * len(active_names) / len(all_scafs)
+                    cur_size = seq_size(st.current_genome)
+                    st.round_skipped_bp = int(cur_size * (1 - st.round_active_pct / 100.0))
+                except Exception:
+                    pass
+            cmd.extend([st.current_genome, ltr_file])
+            log.step(f"  Running FastLTR on {Path(st.current_genome).name} ...")
+            with timed(f"round {round_num}: FastLTR"):
+                log.run_tool(cmd, f"fastltr_round{round_num}{tag}")
+
+        extracted_fa = str(round_dir / f"{st.base}_round{round_num}_ltr_sequences.fasta")
+        with timed(f"round {round_num}: extract sequences"):
+            log.run_tool(
+                [EXTRACT_LTRS_BIN, st.current_genome, ltr_file, extracted_fa],
+                f"extract_ltrs_round{round_num}{tag}",
+            )
+
+    st.n_new = sum(1 for line in open(extracted_fa) if line.startswith('>'))
+    log.step(f"  {st.n_new:,} detections extracted in round {round_num}")
+    return extracted_fa
+
+
+def _lift_round_beds(st, extracted_fa, round_num, round_dir, cross_genome):
+    """Write this round's detection + flank and taco lift them to original space.
+    """
+    round_dir.mkdir(parents=True, exist_ok=True)
+    tag = st.tool_tag(cross_genome)
+    round_bed = str(round_dir / f"{st.base}_round{round_num}_detections.bed")
+    write_detection_bed(extracted_fa, st.current_genome, round_bed)
+    if st.taco_stack:
+        lifted_bed = str(round_dir / f"{st.base}_round{round_num}_detections_original.bed")
+        run_lift(round_bed, st.taco_stack, lifted_bed,
+                 log_name=f"taco_lift_round{round_num}_detections{tag}")
+        st.lifted_beds.append(lifted_bed)
+    else:
+        st.lifted_beds.append(round_bed)
+
+    orig_elem = _parse_lifted_bed(st.lifted_beds[-1])
+
+    orig_flank = {}
+    if st.taco_stack:
+        flank_bed = str(round_dir / f"{st.base}_round{round_num}_flank.bed")
+        write_flank_bed(extracted_fa, st.current_genome, flank_bed)
+        flank_lifted = str(round_dir / f"{st.base}_round{round_num}_flank_original.bed")
+        run_lift(flank_bed, st.taco_stack, flank_lifted,
+                 log_name=f"taco_lift_round{round_num}_flank{tag}")
+        orig_flank = _parse_lifted_bed(flank_lifted)
+
+    return orig_elem, orig_flank
+
+
+def _reconcile_nodes(st, extracted_fa, orig_elem, orig_flank, round_num,
+                     cross_genome, skip_converged, no_node_reuse):
+    """Compare this round's detections into the genome's persistent node set.
+    """
+    st.coords_current = {}
+
+    raw    = _read_fasta_records(extracted_fa)        # orig_name -> (header, seq)
+    coords = parse_element_coordinates(extracted_fa)  # orig_name -> (scaf, s, e)
+    by_contig: dict = {}
+    for orig_name, (header, seq) in raw.items():
+        scaffold = coords.get(orig_name, ('', 0, 0))[0]
+        if not scaffold:
+            continue
+        pname   = st.node_name(orig_name, round_num, cross_genome)
+        pheader = st.node_header(header, orig_name, pname, cross_genome)
+        by_contig.setdefault(scaffold, {})[pname] = (orig_name, pheader, seq)
+
+    cur_order = scaffold_order(st.current_genome)
+    if st.scaffold_count is None:
+        st.scaffold_count = len(cur_order)
+    elif len(cur_order) != st.scaffold_count:
+        raise RuntimeError(
+            f"{st.base}: scaffold count changed {st.scaffold_count} → "
+            f"{len(cur_order)} at round {round_num}; seq_index reuse keys "
+            f"would be invalid")
+
+    if skip_converged and st.next_active_file and Path(st.next_active_file).exists():
+        with open(st.next_active_file) as af:
+            reran_contigs = {l.strip() for l in af if l.strip()}
+    else:
+        reran_contigs = set(cur_order)
+
+    new_names: set = set()
+    if round_num == 1 or not st.taco_stack or no_node_reuse:
+        for scaffold in sorted(reran_contigs):
+            for old in st.contig_nodes.get(scaffold, set()):
+                st.node_seq.pop(old, None)
+                st.node_orig_coords.pop(old, None)
+            st.contig_nodes[scaffold] = set()
+            for pname, (orig_name, pheader, seq) in by_contig.get(scaffold, {}).items():
+                st.node_seq[pname] = (pheader, seq)
+                st.contig_nodes[scaffold].add(pname)
+                st.coords_current[pname] = coords[orig_name]
+                oc = orig_elem.get(orig_name)
+                if oc is not None:
+                    st.node_orig_coords[pname] = oc
+                new_names.add(pname)
+    else:
+        # Incremental reuse path
+        n_reused = 0
+        for scaffold in sorted(reran_contigs):
+            old_by_coord: dict = {}
+            for old in sorted(st.contig_nodes.get(scaffold, set())):
+                oc = st.node_orig_coords.get(old)
+                if oc is not None:
+                    old_by_coord.setdefault(oc, []).append(old)
+            survivors: set = set()
+            for pname, (orig_name, pheader, seq) in by_contig.get(scaffold, {}).items():
+                es = orig_elem.get(orig_name)
+                fs = orig_flank.get(orig_name)
+                affected = False
+                if fs is not None:
+                    si, fa, fb = fs
+                    for ra, rb in st.last_removed_orig.get(si, ()):  # half-open
+                        if fa < rb and ra < fb:
+                            affected = True
+                            break
+                match = None
+                if not affected and es is not None:
+                    cands = old_by_coord.get(es)
+                    if cands:
+                        for i, cand in enumerate(cands):
+                            if st.node_seq.get(cand, (None, None))[1] == seq:
+                                match = cand
+                                cands.pop(i)
+                                break
+                if match is not None:
+                    st.coords_current[match] = coords[orig_name]
+                    survivors.add(match)
+                    n_reused += 1
+                else:
+                    st.node_seq[pname] = (pheader, seq)
+                    st.coords_current[pname] = coords[orig_name]
+                    if es is not None:
+                        st.node_orig_coords[pname] = es
+                    new_names.add(pname)
+                    survivors.add(pname)
+            # drop old nodes neither reused nor re-detected on this contig
+            for old in st.contig_nodes.get(scaffold, set()):
+                if old not in survivors:
+                    st.node_seq.pop(old, None)
+                    st.node_orig_coords.pop(old, None)
+            st.contig_nodes[scaffold] = survivors
+        log.info(f"  [incremental] reused {n_reused} node(s), {len(new_names)} new "
+                 f"across {len(reran_contigs)} active contig(s)")
+
+    return new_names
+
+# ---------------------------------------------------------------------------
+# One round, all genomes: pooled universe, clustering, classification
+# ---------------------------------------------------------------------------
+
+def _build_universe(states, round_dir, round_num, base, new_names):
+    """Pool every genome's current nodes into one record set for clustering."""
+    from engine.feature_cluster import _load_records
+
+    universe_fa = str(round_dir / f"{base}_round{round_num}_universe.fasta")
+    with open(universe_fa, 'w') as out:
+        for st in states:
+            for name, (header, seq) in st.node_seq.items():
+                out.write(header + '\n')
+                out.write(seq + '\n')
+    records = _load_records(universe_fa)
+
+    Path(universe_fa).unlink(missing_ok=True)
+    n_nodes     = sum(len(st.node_seq) for st in states)
+    n_collapsed = sum(len(st.collapsed_nodes) for st in states)
+    n_stable    = n_nodes - len(new_names) - n_collapsed
+    log.info(f"  Universe: {len(records)} nodes "
+             f"({len(new_names)} new, {n_collapsed} collapsed-back, "
+             f"{n_stable} stable)")
+    return records
+
+
+def _cluster_round(records, states, new_names, reuse_store, frozen_params,
+                   fcfg, kmer_lib, wfa_lib, clustering_dir, round_num,
+                   no_node_reuse):
+    """Cluster the pooled detections, reusing surviving edges.
+    """
+    from engine.feature_cluster import cluster_records_incremental, _write_gml
+
+    live = set()
+    for st in states:
+        live.update(st.node_seq)
+    reuse_edges = {(a, b): attrs for (a, b), attrs in reuse_store.items()
+                   if a in live and b in live}
+    first_round = (round_num == 1 or not reuse_edges or no_node_reuse)
+    with timed(f"round {round_num}: incremental cluster"):
         consensi_fa, membership_tsv, _all_results, G = cluster_records_incremental(
-            records, fcfg, kmer_lib, wfa_lib, out,
+            records, fcfg, kmer_lib, wfa_lib, clustering_dir,
+            new_names=(None if first_round else new_names),
+            reuse_edges=(None if first_round else reuse_edges),
+            frozen_params=frozen_params,
         )
 
     if fcfg.debug:
-        _write_gml(G, out)
+        _write_gml(G, clustering_dir)
 
-    classified_fa = str(out / 'consensi_classified_tesorter.fasta')
-    if Path(consensi_fa).exists() and Path(consensi_fa).stat().st_size > 0:
-        classify(consensi_fa, classified_fa, args)
-        if fcfg.debug and (out / 'similarity_graph.gml').exists():
-            write_classified_gml(
-                gml_path=str(out / 'similarity_graph.gml'),
-                membership_tsv=membership_tsv,
-                classified_fasta=classified_fa,
-                output_path=str(out / 'similarity_graph_classified.gml'),
-            )
-    else:
-        open(classified_fa, 'w').close()
-
-    return consensi_fa, classified_fa
+    idx_name = [r.name for r in records]
+    reuse_store = {
+        (idx_name[u], idx_name[v]): attrs
+        for u, v, attrs in G.edges(data=True)
+    }
+    return consensi_fa, membership_tsv, G, reuse_store
 
 
-
-
-def run_rounds(genome_for_ltr, base, output_dir, round1_extracted,
-               original_genome_size, args, tandem_layers=None):
-    """Exact incremental TE collapse via a persistent element similarity graph.
+def _classify_round(consensi_fa, membership_tsv, clustering_dir, round_num,
+                    args, fcfg):
+    """One TEsorter pass over the round's consensi.
     """
-    # libgomp reads OMP_NUM_THREADS exactly once, in its load-time constructor,
-    # so this MUST run before anything for parallelism
-    os.environ['OMP_NUM_THREADS'] = str(max(1, args.threads))
+    from engine.feature_cluster import write_classified_gml
 
-    from engine.feature_cluster import (
-        _load_records, cluster_records_incremental, _ALGO_DIR,
-        _write_gml, write_classified_gml,
-    )
-    from algorithms.c_libs import KmerLib, WFALib
-
-    kmer_lib = KmerLib(_ALGO_DIR / 'kmer_seed.so')
-    wfa_lib  = WFALib(_ALGO_DIR / 'wfa_align.so')
-    fcfg     = build_feature_config(args)
-
-    # ── persistent graph state across rounds ────────────────────────────────
-    node_seq:        dict = {}    # name -> (header, seq) for every current node
-    contig_nodes:    dict = {}    # scaffold -> set[name] currently in the genome
-    collapsed_nodes: set  = set() # names collapsed out of the genome (frozen)
-    reuse_store:     dict = {}    # (name_a, name_b) -> edge attrs (surviving edges)
-    frozen_params:   dict = {}    # set-dependent seeding params, frozen at round 1
-    node_orig_coords: dict = {}   # name -> (seq_index, orig_start, orig_end) in original space
-    last_removed_orig: dict = {}  # seq_index -> [(ra, rb), ...] prev round's removals (original space)
-    scaffold_count            = None 
-
-    taco_stack     = []
-    lifted_beds    = []
-    round_stats    = []
-    current_genome = str(genome_for_ltr)
-   
-    keep_genomes   = {str(genome_for_ltr), str(getattr(args, 'genome', '') or '')}
-
-    skip_converged   = True
-    next_active_file = None
-
-    no_node_reuse = bool(os.environ.get('HIREPEAT_NO_NODE_REUSE'))
-    if no_node_reuse:
-        log.stage("  [HIREPEAT_NO_NODE_REUSE] node + edge reuse DISABLED "
-                  "(full universe rebuild + from-scratch re-cluster each round)")
-
-    final_classified_src = None
-    final_membership_src = None
-
-    # ── Round 0: tandem compression layers ──────────────────────────────────
-    if tandem_layers:
-        for taco_file, _ in tandem_layers:
-            taco_stack.append(taco_file)
-        compressed_size = seq_size(current_genome)
-        compress_pct = 100.0 * (1 - compressed_size / original_genome_size)
-        log.info(f"\n  Round 0 (tandem compression, {len(tandem_layers)} layer(s)):")
-        try:
-            log.block(log.INFO, run_info(tandem_layers[-1][0]))
-        except Exception:
-            pass
-        log.info(f"  Genome size: {original_genome_size:,} → {compressed_size:,} bp "
-                 f"({compress_pct:.1f}% removed)")
-        round_stats.append({
-            'round': '0(tan)', 'detections': '-', 'families': '-',
-            'non_ltr': '-', 'new_ltr_members': '-', 'collapse_events': '-',
-            'genome_size_bp': compressed_size, 'compression_pct': compress_pct,
-            'time_s': 0.0,
-        })
-
-    max_rounds = args.rounds
-
-    for round_num in range(1, max_rounds + 1):
-        t_round = time.perf_counter()
-        round_dir = output_dir / f"round{round_num}"
-        round_dir.mkdir(exist_ok=True)
-
-        stack_note = f", {len(taco_stack)} taco layer(s)" if taco_stack else ''
-        log.stage(f"\n── Round {round_num}/{max_rounds} ── "
-                  f"{Path(current_genome).name}{stack_note}")
-        log.info(f"  Genome: {current_genome}")
-
-        # ── detect + extract for this round ─────────────────────────────────
-        round_active_pct = 100.0
-        round_skipped_bp = 0
-        if round_num == 1:
-            extracted_fa = str(round1_extracted)
-        else:
-            ltr_file = str(round_dir / f"{base}_round{round_num}_LTR.1aln")
-            if Path(ltr_file).exists():
-                try:
-                    n_prev = aln_info(ltr_file)['alignments']
-                except Exception:
-                    n_prev = None
-                log.stage(f"  [resume] Reusing existing {Path(ltr_file).name}"
-                          + (f" ({n_prev:,} alignments)" if n_prev is not None
-                             else " (unreadable — delete it if this run fails)"))
-                if n_prev == 0:
-                    log.warn(f"{ltr_file} contains no alignments; delete it to "
-                             f"re-run FastLTR for this round.")
-            else:
-                cmd = [FASTLTR_BIN, '-v']
-                if skip_converged and next_active_file is not None \
-                        and Path(next_active_file).exists():
-                    cmd.append(f'-r{next_active_file}')
-                    try:
-                        with open(next_active_file) as af:
-                            active_names = {l.strip() for l in af if l.strip()}
-                        all_scafs = scaffold_order(current_genome)
-                        if all_scafs:
-                            round_active_pct = 100.0 * len(active_names) / len(all_scafs)
-                        cur_size = seq_size(current_genome)
-                        round_skipped_bp = int(cur_size * (1 - round_active_pct / 100.0))
-                    except Exception:
-                        pass
-                cmd.extend([current_genome, ltr_file])
-                log.step(f"  Running FastLTR on {Path(current_genome).name} ...")
-                with timed(f"round {round_num}: FastLTR"):
-                    log.run_tool(cmd, f"fastltr_round{round_num}")
-
-            extracted_fa = str(round_dir / f"{base}_round{round_num}_ltr_sequences.fasta")
-            with timed(f"round {round_num}: extract sequences"):
-                log.run_tool(
-                    [EXTRACT_LTRS_BIN, current_genome, ltr_file, extracted_fa],
-                    f"extract_ltrs_round{round_num}",
-                )
-
-        n_new = sum(1 for line in open(extracted_fa) if line.startswith('>'))
-        log.step(f"  {n_new:,} detections extracted in round {round_num}")
-
-        # ── BED of this round's detections, lifted to original coords ───────
-        round_bed = str(round_dir / f"{base}_round{round_num}_detections.bed")
-        write_detection_bed(extracted_fa, current_genome, round_bed)
-        if taco_stack:
-            lifted_bed = str(round_dir / f"{base}_round{round_num}_detections_original.bed")
-            run_lift(round_bed, taco_stack, lifted_bed,
-                     log_name=f"taco_lift_round{round_num}_detections")
-            lifted_beds.append(lifted_bed)
-        else:
-            lifted_beds.append(round_bed)
-
-        orig_elem = _parse_lifted_bed(lifted_beds[-1]) 
-
-        orig_flank: dict = {}
-        if taco_stack:
-            flank_bed = str(round_dir / f"{base}_round{round_num}_flank.bed")
-            write_flank_bed(extracted_fa, current_genome, flank_bed)
-            flank_lifted = str(round_dir / f"{base}_round{round_num}_flank_original.bed")
-            run_lift(flank_bed, taco_stack, flank_lifted,
-                     log_name=f"taco_lift_round{round_num}_flank")
-            orig_flank = _parse_lifted_bed(flank_lifted)
-
-        # ── reconcile graph nodes ───────────────────────────────────────────
-        raw    = _read_fasta_records(extracted_fa)        # orig_name -> (header, seq)
-        coords = parse_element_coordinates(extracted_fa)  # orig_name -> (scaf,s,e)
-        coords_current: dict = {}    # node_name -> (scaf,s,e) for THIS round's detections
-        prefix    = f"r{round_num}_"
-        by_contig: dict = {}
-        for orig_name, (header, seq) in raw.items():
-            scaffold = coords.get(orig_name, ('', 0, 0))[0]
-            if not scaffold:
-                continue
-            pname   = prefix + orig_name
-            pheader = header.replace(f">{orig_name}", f">{pname}", 1)
-            by_contig.setdefault(scaffold, {})[pname] = (pheader, seq)
-
-
-        cur_order = scaffold_order(current_genome)
-        if scaffold_count is None:
-            scaffold_count = len(cur_order)
-        elif len(cur_order) != scaffold_count:
-            raise RuntimeError(
-                f"scaffold count changed {scaffold_count} → {len(cur_order)} at "
-                f"round {round_num}; seq_index reuse keys would be invalid")
-
-
-        if skip_converged and next_active_file and Path(next_active_file).exists():
-            with open(next_active_file) as af:
-                reran_contigs = {l.strip() for l in af if l.strip()}
-        else:
-            reran_contigs = set(cur_order)
-
-        new_names: set = set()
-        if round_num == 1 or not taco_stack or no_node_reuse:
-            for scaffold in sorted(reran_contigs):
-                for old in contig_nodes.get(scaffold, set()):
-                    node_seq.pop(old, None)
-                    node_orig_coords.pop(old, None)
-                contig_nodes[scaffold] = set()
-                for pname, (pheader, seq) in by_contig.get(scaffold, {}).items():
-                    node_seq[pname] = (pheader, seq)
-                    contig_nodes[scaffold].add(pname)
-                    coords_current[pname] = coords[pname[len(prefix):]]
-                    oc = orig_elem.get(pname[len(prefix):])
-                    if oc is not None:
-                        node_orig_coords[pname] = oc
-                    new_names.add(pname)
-        else:
-            # Incremental reuse path
-            n_reused = 0
-            for scaffold in sorted(reran_contigs):
-                old_by_coord: dict = {}
-                for old in sorted(contig_nodes.get(scaffold, set())):
-                    oc = node_orig_coords.get(old)
-                    if oc is not None:
-                        old_by_coord.setdefault(oc, []).append(old)
-                survivors: set = set()
-                for pname, (pheader, seq) in by_contig.get(scaffold, {}).items():
-                    orig_name = pname[len(prefix):]
-                    es = orig_elem.get(orig_name)   
-                    fs = orig_flank.get(orig_name)   
-                    affected = False
-                    if fs is not None:
-                        si, fa, fb = fs
-                        for ra, rb in last_removed_orig.get(si, ()):  # half-open
-                            if fa < rb and ra < fb:
-                                affected = True
-                                break
-                    match = None
-                    if not affected and es is not None:
-                        cands = old_by_coord.get(es)
-                        if cands:
-                            for i, cand in enumerate(cands):
-                                if node_seq.get(cand, (None, None))[1] == seq:
-                                    match = cand
-                                    cands.pop(i)
-                                    break
-                    if match is not None:
-                        coords_current[match] = coords[orig_name]
-                        survivors.add(match)
-                        n_reused += 1
-                    else:
-                        node_seq[pname] = (pheader, seq)
-                        coords_current[pname] = coords[orig_name]
-                        if es is not None:
-                            node_orig_coords[pname] = es
-                        new_names.add(pname)
-                        survivors.add(pname)
-                # drop old nodes neither reused nor re-detected on this contig
-                for old in contig_nodes.get(scaffold, set()):
-                    if old not in survivors:
-                        node_seq.pop(old, None)
-                        node_orig_coords.pop(old, None)
-                contig_nodes[scaffold] = survivors
-            log.info(f"  [incremental] reused {n_reused} node(s), {len(new_names)} new "
-                     f"across {len(reran_contigs)} active contig(s)")
-
-        # ── build the current universe of elements (stable + collapsed-back + new) ──────
-        universe_fa = str(round_dir / f"{base}_round{round_num}_universe.fasta")
-        with open(universe_fa, 'w') as out:
-            for name, (header, seq) in node_seq.items():
-                out.write(header + '\n')
-                out.write(seq + '\n')
-        records = _load_records(universe_fa)
-
-        Path(universe_fa).unlink(missing_ok=True)
-        n_stable = len(node_seq) - len(new_names) - len(collapsed_nodes)
-        log.info(f"  Universe: {len(records)} nodes "
-                 f"({len(new_names)} new, {len(collapsed_nodes)} collapsed-back, "
-                 f"{n_stable} stable)")
-
-        # ── incremental cluster (WFA only on new-incident pairs) ────────────
-        reuse_edges = {(a, b): attrs for (a, b), attrs in reuse_store.items()
-                       if a in node_seq and b in node_seq}
-        first_round = (round_num == 1 or not reuse_edges or no_node_reuse)
-        clustering_dir = round_dir / 'clustering'
-        with timed(f"round {round_num}: incremental cluster"):
-            consensi_fa, membership_tsv, all_results, G = cluster_records_incremental(
-                records, fcfg, kmer_lib, wfa_lib, clustering_dir,
-                new_names=(None if first_round else new_names),
-                reuse_edges=(None if first_round else reuse_edges),
-                frozen_params=frozen_params,
-            )
-
+    classifications = {}
+    classified_fa = str(clustering_dir / 'consensi_classified_tesorter.fasta')
+    if Path(consensi_fa).exists() and Path(consensi_fa).stat().st_size > 0:
+        classify(consensi_fa, classified_fa, args,
+                 label=f"round {round_num}: classify",
+                 log_name=f"tesorter_round{round_num}")
+        classifications = parse_classifications(classified_fa)
+        # Debug-only: annotate the similarity graph with classifier labels.
         if fcfg.debug:
-            _write_gml(G, clustering_dir)
-
-        idx_name = [r.name for r in records]
-        reuse_store = {
-            (idx_name[u], idx_name[v]): attrs
-            for u, v, attrs in G.edges(data=True)
-        }
-
-        # ── classify component consensi to decide what to collapse ──────────
-        classifications = {}
-        classified_fa = str(clustering_dir / 'consensi_classified_tesorter.fasta')
-        if Path(consensi_fa).exists() and Path(consensi_fa).stat().st_size > 0:
-            classify(consensi_fa, classified_fa, args,
-                     label=f"round {round_num}: classify",
-                     log_name=f"tesorter_round{round_num}")
-            classifications = parse_classifications(classified_fa)
-            # Debug-only: annotate the similarity graph with classifier labels.
-            if fcfg.debug:
-                gml_in = clustering_dir / 'similarity_graph.gml'
-                if gml_in.exists():
-                    write_classified_gml(
-                        gml_path=str(gml_in),
-                        membership_tsv=membership_tsv,
-                        classified_fasta=classified_fa,
-                        output_path=str(clustering_dir / 'similarity_graph_classified.gml'),
-                    )
-        membership = (parse_cluster_membership(membership_tsv)
-                      if Path(membership_tsv).exists() else {})
-
-        final_classified_src = classified_fa if Path(classified_fa).exists() else consensi_fa
-        final_membership_src = membership_tsv
-
-        n_ltr_fams = sum(1 for cls in classifications.values() if _is_ltr_class(cls))
-        n_non_ltr  = len(classifications) - n_ltr_fams
-        log.step(f"  Round {round_num}: {len(membership)} families "
-                 f"({n_ltr_fams} LTR, {n_non_ltr} non-LTR)")
-
-        # ── collapse this round's LTR-classified detections ─────────────────
-        added_coords    = []
-        collapsed_names: set = set()
-        for cons_name, members in membership.items():
-            if not _is_ltr_class(classifications.get(cons_name, 'unknown')):
-                continue
-            for m in members:
-                if m in coords_current:        # only THIS round's fresh detections
-                    added_coords.append(coords_current[m])
-                    collapsed_names.add(m)
-
-        n_events = 0
-        last_removed_orig = {}  
-        if round_num < max_rounds and added_coords:
-            spec_tsv = str(round_dir / f"{base}_round{round_num}_collapse.tsv")
-            output_prefix = str(round_dir / f"{base}_round{round_num}")
-            with timed(f"round {round_num}: build collapse spec"):
-                n_events, active_scaffolds = _collapse_spec_from_coords(
-                    added_coords, current_genome, spec_tsv,
+            gml_in = clustering_dir / 'similarity_graph.gml'
+            if gml_in.exists():
+                write_classified_gml(
+                    gml_path=str(gml_in),
+                    membership_tsv=membership_tsv,
+                    classified_fasta=classified_fa,
+                    output_path=str(clustering_dir / 'similarity_graph_classified.gml'),
                 )
-            next_active_file = str(round_dir / f"active_round{round_num + 1}.txt")
-            with open(next_active_file, 'w') as af:
-                for name in sorted(active_scaffolds):
-                    af.write(name + '\n')
+    membership = (parse_cluster_membership(membership_tsv)
+                  if Path(membership_tsv).exists() else {})
+    return classifications, membership, classified_fa
 
-            if n_events > 0:
-                # Lift this round's removed intervals to original space for the next round.
-                if taco_stack:
-                    removed_lifted = str(
-                        round_dir / f"{base}_round{round_num}_removed_original.bed")
-                    run_lift(spec_tsv, taco_stack, removed_lifted,
-                             log_name=f"taco_lift_round{round_num}_removed")
-                    removed_src = removed_lifted
-                else:
-                    removed_src = spec_tsv   # current space == original space
-                with open(removed_src) as rf:
-                    for line in rf:
-                        if line.startswith('#'):
-                            continue
-                        parts = line.split('\t')
-                        if len(parts) < 3:
-                            continue
-                        si, ra, rb = int(parts[0]), int(parts[1]), int(parts[2])
-                        last_removed_orig.setdefault(si, []).append((ra, rb))
 
-                with timed(f"round {round_num}: taco collapse"):
-                    collapsed_fa, taco_file = run_collapse(
-                        current_genome, spec_tsv, output_prefix,
-                        log_name=f"taco_collapse_round{round_num}",
-                    )
-                taco_stack.append(taco_file)
-                if PRUNE_GENOMES:
-                    _prune_genome_snapshot(current_genome, keep=keep_genomes)
-                current_genome = collapsed_fa
-                new_size = seq_size(collapsed_fa)
-                log.step(f"  Collapsed {n_events:,} interval(s) → genome {new_size:,} bp "
-                         f"({100.0 * (1 - new_size / original_genome_size):.1f}% removed)")
+# ---------------------------------------------------------------------------
+# One round, one genome: collapse
+# ---------------------------------------------------------------------------
 
-                # Collapsed detections become frozen nodes: out of the genome,
-                # but kept as clustering evidence across future rounds.
-                for m in collapsed_names:
-                    scaf = coords_current[m][0]
-                    contig_nodes.get(scaf, set()).discard(m)
-                    collapsed_nodes.add(m)
+def _collapse_genome(st, membership, classifications, round_num, max_rounds,
+                     round_dir, keep_genomes, cross_genome):
+    """Collapse this genome's LTR-classified detections out of its own sequence.
+    """
+    added_coords    = []
+    collapsed_names: set = set()
+    for cons_name, members in membership.items():
+        if not _is_ltr_class(classifications.get(cons_name, 'unknown')):
+            continue
+        for m in members:
+            if m in st.coords_current:     # only THIS genome's fresh detections
+                added_coords.append(st.coords_current[m])
+                collapsed_names.add(m)
 
-        genome_size_now = seq_size(current_genome)
-        round_stats.append({
-            'round': round_num,
-            'detections': n_new,
-            'families': n_ltr_fams,
-            'non_ltr': n_non_ltr,
-            'new_ltr_members': len(collapsed_names),
-            'collapse_events': n_events,
-            'matched': '-',
-            'genome_size_bp': genome_size_now,
-            'compression_pct': 100.0 * (1 - genome_size_now / original_genome_size),
-            'active_pct': round_active_pct,
-            'skipped_bp': round_skipped_bp,
-            'time_s': time.perf_counter() - t_round,
-        })
+    n_events = 0
+    st.last_removed_orig = {}
+    if round_num < max_rounds and added_coords:
+        round_dir.mkdir(parents=True, exist_ok=True)
+        tag = st.tool_tag(cross_genome)
+        spec_tsv = str(round_dir / f"{st.base}_round{round_num}_collapse.tsv")
+        output_prefix = str(round_dir / f"{st.base}_round{round_num}")
+        with timed(f"round {round_num}: build collapse spec"):
+            n_events, active_scaffolds, n_dropped = _collapse_spec_from_coords(
+                added_coords, st.current_genome, spec_tsv,
+            )
+        if n_dropped:
+            log.warn(f"{st.base}: {n_dropped} collapse coordinate(s) named a "
+                     f"scaffold absent from {Path(st.current_genome).name} and "
+                     f"were dropped — these elements will not be collapsed.")
+        st.next_active_file = str(round_dir / f"active_round{round_num + 1}.txt")
+        with open(st.next_active_file, 'w') as af:
+            for name in sorted(active_scaffolds):
+                af.write(name + '\n')
 
-        if round_num < max_rounds and not added_coords:
-            log.stage("  No new LTR members to collapse — converged.")
-            break
+        if n_events > 0:
+            # Lift this round's removed intervals to original space for the next round.
+            if st.taco_stack:
+                removed_lifted = str(
+                    round_dir / f"{st.base}_round{round_num}_removed_original.bed")
+                run_lift(spec_tsv, st.taco_stack, removed_lifted,
+                         log_name=f"taco_lift_round{round_num}_removed{tag}")
+                removed_src = removed_lifted
+            else:
+                removed_src = spec_tsv   # current space == original space
+            with open(removed_src) as rf:
+                for line in rf:
+                    if line.startswith('#'):
+                        continue
+                    parts = line.split('\t')
+                    if len(parts) < 3:
+                        continue
+                    si, ra, rb = int(parts[0]), int(parts[1]), int(parts[2])
+                    st.last_removed_orig.setdefault(si, []).append((ra, rb))
 
-    # ── combine per-round lifted BEDs ───────────────────────────────────────
+            with timed(f"round {round_num}: taco collapse"):
+                collapsed_fa, taco_file = run_collapse(
+                    st.current_genome, spec_tsv, output_prefix,
+                    log_name=f"taco_collapse_round{round_num}{tag}",
+                )
+            st.taco_stack.append(taco_file)
+            if PRUNE_GENOMES:
+                _prune_genome_snapshot(st.current_genome, keep=keep_genomes)
+            st.current_genome = collapsed_fa
+            new_size = seq_size(collapsed_fa)
+            log.step(f"  Collapsed {n_events:,} interval(s) → genome {new_size:,} bp "
+                     f"({100.0 * (1 - new_size / st.original_size):.1f}% removed)")
+
+            # Collapsed detections become frozen nodes: out of the genome,
+            # but kept as clustering evidence across future rounds.
+            for m in collapsed_names:
+                scaf = st.coords_current[m][0]
+                st.contig_nodes.get(scaf, set()).discard(m)
+                st.collapsed_nodes.add(m)
+
+    if round_num < max_rounds and not added_coords:
+        st.converged = True
+        tag = f" [{st.base}]" if cross_genome else ''
+        log.stage(f"  No new LTR members to collapse — converged.{tag}")
+
+    return n_events, collapsed_names
+
+
+def _round_stats_row(st, round_num, n_events, n_collapsed, n_ltr_fams, n_non_ltr,
+                     t_round, cross_genome):
+    genome_size_now = seq_size(st.current_genome)
+    row = {
+        'round': round_num,
+        'detections': st.n_new,
+        'families': n_ltr_fams,
+        'non_ltr': n_non_ltr,
+        'new_ltr_members': n_collapsed,
+        'collapse_events': n_events,
+        'matched': '-',
+        'genome_size_bp': genome_size_now,
+        'compression_pct': 100.0 * (1 - genome_size_now / st.original_size),
+        'active_pct': st.round_active_pct,
+        'skipped_bp': st.round_skipped_bp,
+        'time_s': time.perf_counter() - t_round,
+    }
+    if cross_genome:
+        row['genome'] = st.base
+    return row
+
+
+# ---------------------------------------------------------------------------
+# Final outputs
+# ---------------------------------------------------------------------------
+
+def _finalize(states, output_dir, base, final_classified_src,
+              final_membership_src, round_stats, cross_genome):
+    """Write all_rounds/ and final/, and print the summary table."""
     all_rounds_dir = Path(output_dir) / 'all_rounds'
     all_rounds_dir.mkdir(parents=True, exist_ok=True)
 
-    combined_bed = str(all_rounds_dir / f"{base}_all_rounds_original.bed")
-    with open(combined_bed, 'w') as out:
-        out.write("#seq_index\tstart\tend\telement_id\tround\n")
-        for rnd, bed in enumerate(lifted_beds, start=1):
-            if Path(bed).exists():
-                with open(bed) as inp:
-                    for line in inp:
-                        if line.startswith('#'):
-                            continue
-                        out.write(f"{line.rstrip()}\t{rnd}\n")
+    for st in states:
+        stem = st.base if cross_genome else base
+        combined_bed = str(all_rounds_dir / f"{stem}_all_rounds_original.bed")
+        with open(combined_bed, 'w') as out:
+            out.write("#seq_index\tstart\tend\telement_id\tround\n")
+            for rnd, bed in enumerate(st.lifted_beds, start=1):
+                if Path(bed).exists():
+                    with open(bed) as inp:
+                        for line in inp:
+                            if line.startswith('#'):
+                                continue
+                            out.write(f"{line.rstrip()}\t{rnd}\n")
 
     # ── final library = last round's consensi (deduplicated by construction) ─
     final_classified = str(all_rounds_dir / f"{base}_all_rounds_classified.fasta")
@@ -1083,7 +1126,12 @@ def run_rounds(genome_for_ltr, base, output_dir, round1_extracted,
         open(final_membership, 'w').close()
     log.info(f"\n  all_rounds/ consensi:     {final_classified}")
     log.info(f"  all_rounds/ membership:   {final_membership}")
-    log.info(f"  all_rounds/ detections:   {combined_bed}")
+    if not cross_genome:
+        log.info(f"  all_rounds/ detections:   "
+                 f"{all_rounds_dir / f'{base}_all_rounds_original.bed'}")
+    else:
+        log.info(f"  all_rounds/ detections:   one BED per genome under "
+                 f"{all_rounds_dir}")
 
     ltr_fa, rm_fa, n_kept, n_dropped = write_final_library(
         final_classified, output_dir, base)
@@ -1092,20 +1140,188 @@ def run_rounds(genome_for_ltr, base, output_dir, round1_extracted,
               f"({n_kept} families)")
     log.stage(f"  {rm_fa}   (RepeatMasker: >NAME#CLASS)") # writing an additional file compatible with RepeatMasker
 
-    _print_incremental_summary(round_stats)
+    _print_incremental_summary(round_stats, cross_genome)
+    return final_classified, final_membership
 
-    return [final_classified], [final_membership], taco_stack, round_stats
+
+# ---------------------------------------------------------------------------
+# Main iterative loop
+# ---------------------------------------------------------------------------
+
+def _run_round_loop(states, base, output_dir, args, cross_genome):
+    """Iterative collapse over one or more genomes sharing one clustering.
+    """
+    # libgomp reads OMP_NUM_THREADS exactly once, in its load-time constructor,
+    # so this MUST run before anything for parallelism
+    os.environ['OMP_NUM_THREADS'] = str(max(1, args.threads))
+
+    from engine.feature_cluster import _ALGO_DIR
+    from algorithms.c_libs import KmerLib, WFALib
+
+    kmer_lib = KmerLib(_ALGO_DIR / 'kmer_seed.so')
+    wfa_lib  = WFALib(_ALGO_DIR / 'wfa_align.so')
+    fcfg     = build_feature_config(args)
+
+    # ── state shared by every genome ────────────────────────────────────────
+    reuse_store:   dict = {}   # (name_a, name_b) -> edge attrs (surviving edges)
+    frozen_params: dict = {}   # set-dependent seeding params, frozen at round 1
+    round_stats:   list = []
+
+    keep_genomes = set()
+    for st in states:
+        keep_genomes.add(str(st.current_genome))
+        keep_genomes.add(str(st.source_path or ''))
+
+    skip_converged = True
+
+    no_node_reuse = bool(os.environ.get('HIREPEAT_NO_NODE_REUSE'))
+    if no_node_reuse:
+        log.stage("  [HIREPEAT_NO_NODE_REUSE] node + edge reuse DISABLED "
+                  "(full universe rebuild + from-scratch re-cluster each round)")
+
+    final_classified_src = None
+    final_membership_src = None
+
+    # ── Round 0: tandem compression layers ──────────────────────────────────
+    for st in states:
+        _round0_tandem(st, st.tandem_layers, round_stats, cross_genome)
+
+    max_rounds = args.rounds
+
+    for round_num in range(1, max_rounds + 1):
+        round_dir = output_dir / f"round{round_num}"
+        round_dir.mkdir(parents=True, exist_ok=True)
+
+        active = [st for st in states if not st.converged]
+        if not active:
+            break
+        if cross_genome:
+            log.stage(f"\n══ Round {round_num}/{max_rounds} ── "
+                      f"{len(active)}/{len(states)} genome(s) active")
+
+        # ── per genome: detect, lift, reconcile ─────────────────────────────
+        t_round   = {}
+        new_names = set()
+        for st in active:
+            t_round[st.base] = time.perf_counter()
+            gdir = st.round_dir(output_dir, round_num, cross_genome)
+            extracted_fa = _detect_round(st, round_num, max_rounds, gdir, args,
+                                         skip_converged, cross_genome)
+            orig_elem, orig_flank = _lift_round_beds(
+                st, extracted_fa, round_num, gdir, cross_genome)
+            new_names |= _reconcile_nodes(
+                st, extracted_fa, orig_elem, orig_flank, round_num,
+                cross_genome, skip_converged, no_node_reuse)
+        for st in states:
+            if st.converged:          # contributes nodes, but nothing collapsible
+                st.coords_current = {}
+                st.last_removed_orig = {}
+
+        if cross_genome:
+            seen: dict = {}
+            for st in states:
+                stray = set(st.coords_current) - set(st.node_seq)
+                if stray:
+                    raise RuntimeError(
+                        f"{st.base}: {len(stray)} collapse-eligible name(s) are "
+                        f"not nodes of this genome, e.g. {sorted(stray)[:3]}")
+                for name in st.coords_current:
+                    if name in seen:
+                        raise RuntimeError(
+                            f"element {name} is collapse-eligible in both "
+                            f"{seen[name]} and {st.base}")
+                    seen[name] = st.base
+
+        # ── pooled universe → one clustering → one classification ───────────
+        records = _build_universe(states, round_dir, round_num, base, new_names)
+        clustering_dir = round_dir / 'clustering'
+        consensi_fa, membership_tsv, _G, reuse_store = _cluster_round(
+            records, states, new_names, reuse_store, frozen_params,
+            fcfg, kmer_lib, wfa_lib, clustering_dir, round_num, no_node_reuse,
+        )
+        classifications, membership, classified_fa = _classify_round(
+            consensi_fa, membership_tsv, clustering_dir, round_num, args, fcfg)
+
+        final_classified_src = classified_fa if Path(classified_fa).exists() else consensi_fa
+        final_membership_src = membership_tsv
+
+        n_ltr_fams = sum(1 for cls in classifications.values() if _is_ltr_class(cls))
+        n_non_ltr  = len(classifications) - n_ltr_fams
+        log.step(f"  Round {round_num}: {len(membership)} families "
+                 f"({n_ltr_fams} LTR, {n_non_ltr} non-LTR)")
+
+        # ── per genome: collapse its own members of the LTR families ────────
+        for st in active:
+            gdir = st.round_dir(output_dir, round_num, cross_genome)
+            n_events, collapsed_names = _collapse_genome(
+                st, membership, classifications, round_num, max_rounds,
+                gdir, keep_genomes, cross_genome)
+            round_stats.append(_round_stats_row(
+                st, round_num, n_events, len(collapsed_names),
+                n_ltr_fams, n_non_ltr, t_round[st.base], cross_genome))
+
+        if all(st.converged for st in states):
+            break
+
+    final_classified, final_membership = _finalize(
+        states, output_dir, base, final_classified_src, final_membership_src,
+        round_stats, cross_genome)
+
+    taco_stacks = [st.taco_stack for st in states]
+    return ([final_classified], [final_membership],
+            taco_stacks[0] if len(taco_stacks) == 1 else taco_stacks,
+            round_stats)
 
 
-def _print_incremental_summary(round_stats):
+def run_rounds(genome_for_ltr, base, output_dir, round1_extracted,
+               original_genome_size, args, tandem_layers=None):
+    """Exact incremental TE collapse via a persistent element similarity graph.
+
+    Single-genome: one GenomeState through the shared loop.
+    """
+    st = GenomeState(
+        source_path=str(getattr(args, 'genome', '') or ''),
+        base=base,
+        original_size=original_genome_size,
+        current_genome=str(genome_for_ltr),
+        round1_extracted=str(round1_extracted),
+        tandem_layers=list(tandem_layers or []),
+    )
+    return _run_round_loop([st], base, output_dir, args, cross_genome=False)
+
+
+def make_genome_state(genome_path, base, original_size, genome_for_ltr,
+                      round1_extracted, tandem_layers):
+    """One genome's state for the cross-genome collapse loop."""
+    return GenomeState(
+        source_path=str(genome_path),
+        base=base,
+        original_size=original_size,
+        current_genome=str(genome_for_ltr),
+        round1_extracted=str(round1_extracted),
+        tandem_layers=list(tandem_layers or []),
+    )
+
+
+def run_rounds_crossgenome(states, base, output_dir, args):
+    """Iterative collapse across several genomes sharing one clustering.
+    """
+    log.stage(f"\nIterative collapse over {len(states)} genome(s), "
+              f"up to {args.rounds} round(s), clustered together")
+    return _run_round_loop(states, base, output_dir, args, cross_genome=True)
+
+
+def _print_incremental_summary(round_stats, cross_genome=False):
     """Per-round summary table for the incremental loop."""
+    gcol = (f" {'Genome':<16}" if cross_genome else '')
+    gsep = (f" {'-'*16}" if cross_genome else '')
     log.stage(f"\n{'=' * 80}")
     log.stage("  Incremental collapse summary")
     log.stage(f"{'=' * 80}")
-    log.stage(f"  {'Round':<9} {'Detect':>7} {'Matched':>8} {'LTRfam':>7} "
+    log.stage(f"  {'Round':<9}{gcol} {'Detect':>7} {'Matched':>8} {'LTRfam':>7} "
               f"{'non-LTR':>8} {'NewMem':>7} {'Collapsed':>10} {'Genome_Mbp':>11} "
               f"{'Active%':>8} {'Time(s)':>8}")
-    log.stage(f"  {'-'*9} {'-'*7} {'-'*8} {'-'*7} {'-'*8} {'-'*7} {'-'*10} "
+    log.stage(f"  {'-'*9}{gsep} {'-'*7} {'-'*8} {'-'*7} {'-'*8} {'-'*7} {'-'*10} "
               f"{'-'*11} {'-'*8} {'-'*8}")
     for s in round_stats:
         det   = s.get('detections', '-')
@@ -1119,7 +1335,8 @@ def _print_incremental_summary(round_stats):
         t_s   = s.get('time_s', 0.0)
         gbp_s  = f"{gbp/1e6:.1f}" if isinstance(gbp, (int, float)) else '-'
         apct_s = f"{apct:.1f}" if isinstance(apct, float) else '-'
-        log.stage(f"  {str(s['round']):<9} {str(det):>7} {str(mat):>8} {str(ltr_):>7} "
+        gval   = (f" {str(s.get('genome', '-')):<16}" if cross_genome else '')
+        log.stage(f"  {str(s['round']):<9}{gval} {str(det):>7} {str(mat):>8} {str(ltr_):>7} "
                   f"{str(nlt):>8} {str(newm):>7} {str(coll):>10} {gbp_s:>11} "
                   f"{apct_s:>8} {t_s:>8.1f}")
     log.stage('')

@@ -138,12 +138,20 @@ source env/bin/activate
 export PYTHONPATH=$(pwd)
 export HIREPEAT_IMAGE=/path/to/HiRepEat.sif    # only if TEsorter is not on PATH
 
-# Simplest run
-python engine/detect.py --genome genome.fa --threads 8
+# Simplest run: default rounds: 10
+python engine/detect.py --genome genome.fa --threads 8 --rounds 10
 
-# Many genomes clustered together into one shared library (cross-genome mode)
+# Many genomes clustered together into one shared library (cross-genome mode): default rounds: 1
 python engine/detect.py --genome-list genomes.txt --threads 8
+
+# Write results to runs/genome_ltr_output/ instead of the current directory
+python engine/detect.py --genome genome.fa --output runs
 ```
+
+### Outputs
+Results go in `<genome>_ltr_output/`, created in the current directory (or next to the list file for `--genome-list`). Use `--output DIR` to specify create desired output location as `DIR` instead.
+
+```final/*_all_rounds_classified.fasta``` contains LTR-RT consensus sequences found, and ```final/*_all_rounds_classified_rm.fasta``` is the same file pre-formatted to give as input to RepeatMasker (https://github.com/Dfam-consortium/RepeatMasker)
 
 ## License
 MIT, see [LICENSE](LICENSE).

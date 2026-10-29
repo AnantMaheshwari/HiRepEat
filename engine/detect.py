@@ -14,7 +14,7 @@ from utilities import log
 from utilities.external import TESORTER_DBS, preflight, set_image
 from utilities.log import setup_logging
 from utilities.path_operations import (
-    genome_label, set_folder_structure, strip_genome_name,
+    gml_safe_label, set_folder_structure, strip_genome_name,
 )
 from utilities.provenance import read_run_params, write_run_params
 
@@ -32,6 +32,10 @@ def parse_args():
                              'Each genome is processed independently through detection and '
                              'extraction, then all extracted sequences are clustered together '
                              'into one shared library (cross-genome mode).')
+    parser.add_argument('--output', default=None,
+                        help='Directory to write the <genome>_ltr_output/ folder into '
+                             '(created if missing). Default: the current directory, '
+                             "or the --genome-list file's directory in cross-genome mode.")
     parser.add_argument('--tandem-rounds', type=int, default=10,
                         dest='tandem_rounds',
                         help='Max number of iterative FasTAN tandem compression rounds. '
@@ -89,8 +93,30 @@ def parse_args():
         ]
         if not args.genome_paths:
             parser.error(f'--genome-list file is empty: {args.genome_list}')
+        _check_unique_genome_names(args.genome_paths, parser)
 
     return args
+
+# need a few of extra checks for iterative collapse (TODO: Anant refactor all of these into asserts)
+def _check_unique_genome_names(paths, parser):
+    """Refuse a genome list whose members would share a namespace (iterative multi-genome collapse checks).
+    """
+    checks = (
+        (strip_genome_name, 'sample name'),
+        (lambda p: gml_safe_label(strip_genome_name(p)), "GML-safe 'genome=' tag"),
+        (lambda p: Path(p).stem, 'tandem-layer file prefix'),
+    )
+    for key, what in checks:
+        seen = {}
+        for p in paths:
+            seen.setdefault(key(p), []).append(p)
+        clashes = {k: v for k, v in seen.items() if len(v) > 1}
+        if clashes:
+            detail = '\n'.join(f"    {k}: " + ', '.join(v)
+                               for k, v in sorted(clashes.items()))
+            parser.error(
+                f"--genome-list: these genomes share a {what}, so their "
+                f"elements, outputs or tandem layers would collide:\n{detail}")
 
 
 def main():
@@ -110,9 +136,9 @@ def _run():
     tool_versions = None if args.rounds == 0 else preflight()
 
     from engine.pipeline import (
-        check_resume, cluster_and_classify, combine_genome_fastas,
-        detect_and_extract, guard_tandem_only_outputs, run_rounds,
-        run_tandem_only,
+        check_genome_list_resume, check_resume, detect_and_extract,
+        guard_tandem_only_outputs, make_genome_state, run_rounds,
+        run_rounds_crossgenome, run_tandem_only,
     )
 
     if args.rounds == 0:
@@ -125,21 +151,21 @@ def _run():
         genome_paths = args.genome_paths
         list_path  = Path(args.genome_list)
         base       = list_path.stem
-        output_dir = list_path.parent / f"{base}_ltr_output"
-        output_dir.mkdir(exist_ok=True)
+        parent     = Path(args.output) if args.output else list_path.parent
+        output_dir = parent / f"{base}_ltr_output"
+        output_dir.mkdir(parents=True, exist_ok=True)
         setup_logging(output_dir / f"{base}_pipeline.log")
 
+        check_genome_list_resume(read_run_params(output_dir / 'run_params.yaml'),
+                                 genome_paths, output_dir)
+
         if args.rounds == 0:
-            stems = [Path(g).stem for g in genome_paths]
-            dupes = sorted({s for s in stems if stems.count(s) > 1})
-            if dupes:
-                raise SystemExit(
-                    f"--rounds 0: genomes sharing a tandem/ prefix would "
-                    f"overwrite each other: {', '.join(dupes)}")
             for gpath in genome_paths:
+                gbase = strip_genome_name(gpath)
                 guard_tandem_only_outputs(
                     output_dir, gpath,
-                    output_dir / f"{strip_genome_name(gpath)}_ltr_sequences.fasta")
+                    [output_dir / f"{gbase}_ltr_sequences.fasta",
+                     output_dir / 'round1' / gbase / f"{gbase}_ltr_sequences.fasta"])
 
         write_run_params(output_dir / 'run_params.yaml', args, output_dir, base,
                          tool_versions=tool_versions)
@@ -150,42 +176,36 @@ def _run():
 
         if args.rounds == 0:
             for gpath in genome_paths:
-                log.stage(f"\n── Genome: {gpath}  (label: {genome_label(gpath)})")
+                log.stage(f"\n── Genome: {gpath}  (label: {strip_genome_name(gpath)})")
                 run_tandem_only(gpath, output_dir, args.tandem_rounds,
                                 prune_genomes=constants.PRUNE_GENOMES)
         else:
-            extracted_fastas = []   # (Path, label)
+            if (output_dir / 'clustering').is_dir():
+                log.warn(f"{output_dir / 'clustering'} is from a previous "
+                         f"single-pass run, will be over-written")
+            states = []
             for gpath in genome_paths:
-                label = genome_label(gpath)
-                log.stage(f"\n── Genome: {gpath}  (label: {label})")
-                efasta, _, _ = detect_and_extract(
-                    gpath, strip_genome_name(gpath), output_dir, args.tandem_rounds,
+                gbase = strip_genome_name(gpath)
+                log.stage(f"\n── Genome: {gpath}  (label: {gbase})")
+                legacy = output_dir / f"{gbase}_ltr_sequences.fasta"
+                detect_dir = output_dir if legacy.exists() else output_dir / 'round1' / gbase
+                if legacy.exists():
+                    log.step(f"         round-1 detections at {legacy}")
+                genome_bp = seq_size(gpath)
+                efasta, genome_for_ltr, tandem_layers = detect_and_extract(
+                    gpath, gbase, output_dir, args.tandem_rounds,
                     prune_genomes=constants.PRUNE_GENOMES,
+                    detect_dir=detect_dir,
                 )
-                extracted_fastas.append((efasta, label))
+                states.append(make_genome_state(
+                    gpath, gbase, genome_bp, genome_for_ltr, efasta, tandem_layers))
 
-            combined_fasta = output_dir / f"{base}_combined_ltr_sequences.fasta"
-            log.step(f"Combining {len(extracted_fastas)} genome FASTAs → {combined_fasta}")
-            combine_genome_fastas(extracted_fastas, combined_fasta)
-
-            consensus_fasta, classified_fasta = cluster_and_classify(
-                str(combined_fasta), output_dir / 'clustering', args,
-            )
-            log.stage(f"Consensus library saved to {consensus_fasta}")
-            log.stage(f"Classified consensus library saved to {classified_fasta}")
-
-            # final/ here too
-            from utilities.final_library import write_final_library
-            ltr_fa, rm_fa, n_kept, n_dropped = write_final_library(
-                classified_fasta, output_dir, base)
-            log.info(f"  {n_dropped} consensi dropped as non-LTR, {n_kept} kept")
-            log.stage(f"\n  {ltr_fa} is the final output LTR-RT library "
-                      f"({n_kept} families)")
-            log.stage(f"  {rm_fa}   (RepeatMasker: >NAME#CLASS)")
+            run_rounds_crossgenome(states, base, output_dir, args)
 
     else:
         # ── Single-genome path ────────────────────────────────────────────────
-        base, output_dir = set_folder_structure(args.genome, "_ltr_output")
+        base, output_dir = set_folder_structure(args.genome, "_ltr_output",
+                                                parent=args.output)
         setup_logging(output_dir / f"{base}_pipeline.log")
         check_resume(read_run_params(output_dir / 'run_params.yaml'),
                      args.genome, base, output_dir)
